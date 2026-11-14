@@ -77,7 +77,7 @@ use serde_derive::Deserialize;
 use serde_json::{Map, Value};
 use simple_error::SimpleError;
 use simple_logger::SimpleLogger;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::BufReader;
@@ -856,7 +856,7 @@ impl SecretScanner {
             debug!("b64_words: {:?}", b64_words);
             debug!("hex_words: {:?}", hex_words);
         }
-        let mut output_hashset: HashSet<String> = HashSet::new();
+        let mut output_hashset: BTreeSet<String> = BTreeSet::new();
         for word in b64_words {
             output_hashset.insert(word);
         }
@@ -879,6 +879,8 @@ impl SecretScanner {
                 output.push(m);
             }
         }
+        // Sort by position so callers get a deterministic ordering across runs.
+        output.sort_by_key(|a| (a.start(), a.end()));
         if !output.is_empty() {
             debug!("entropy_findings output: {:?}", output);
         }
@@ -966,6 +968,22 @@ impl SecretScanner {
         &self,
         findings: &HashSet<T>,
     ) -> anyhow::Result<()> {
+        let mut json_text: Vec<u8> = Vec::new();
+        if self.pretty_print {
+            json_text.append(serde_json::ser::to_vec_pretty(findings)?.as_mut());
+        } else {
+            json_text.append(serde_json::ser::to_vec(findings)?.as_mut());
+        }
+        match &self.output_path {
+            Some(op) => fs::write(op, json_text)?,
+            None => println!("{}", str::from_utf8(json_text.as_ref())?),
+        };
+        Ok(())
+    }
+
+    /// Same as [`output_findings`](Self::output_findings) but for an ordered collection,
+    /// guaranteeing byte-identical JSON output across runs.
+    pub fn output_findings_ordered<T: Serialize>(&self, findings: &[T]) -> anyhow::Result<()> {
         let mut json_text: Vec<u8> = Vec::new();
         if self.pretty_print {
             json_text.append(serde_json::ser::to_vec_pretty(findings)?.as_mut());

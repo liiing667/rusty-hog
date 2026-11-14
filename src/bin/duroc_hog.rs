@@ -47,7 +47,6 @@ use encoding::all::ASCII;
 use encoding::{DecoderTrap, Encoding};
 use path_clean::PathClean;
 use rusty_hog_scanner::{SecretScanner, SecretScannerBuilder};
-use std::collections::HashSet;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq, Hash, Clone, Default)]
 /// `serde_json` object that represents a single found secret - finding
@@ -57,8 +56,12 @@ pub struct FileFinding {
     pub strings_found: Vec<String>,
     pub path: String,
     pub reason: String,
+    /// Every detection rule that produced this finding, sorted and deduplicated.
+    /// `reason` holds the highest-confidence entry (a named regex rule wins over
+    /// the generic entropy detector).
+    pub reasons: Vec<String>,
     pub linenum: usize,
-    pub lineindextuples: Vec<(usize, usize)>
+    pub lineindextuples: Vec<(usize, usize)>,
 }
 
 const ZIPEXTENSIONS: &[&str] = &["zip"];
@@ -178,7 +181,7 @@ fn run(arg_matches: &ArgMatches) -> Result<(), SimpleError> {
         info!("path verification succeeded");
     }
 
-    let mut output: HashSet<FileFinding> = HashSet::new();
+    let mut output: Vec<FileFinding> = Vec::new();
 
     if Path::is_dir(fspath) {
         output.extend(scan_dir(
@@ -193,13 +196,11 @@ fn run(arg_matches: &ArgMatches) -> Result<(), SimpleError> {
         output.extend(scan_file(fspath, &secret_scanner, f, "", unzip));
     }
 
-    let output: HashSet<FileFinding> = output
-        .into_iter()
-        .filter(|ff| !secret_scanner.is_allowlisted_path(&ff.reason, ff.path.as_bytes()))
-        .collect();
+    output.retain(|ff| !secret_scanner.is_allowlisted_path(&ff.reason, ff.path.as_bytes()));
+    sort_findings(&mut output);
 
     info!("Found {} secrets", output.len());
-    match secret_scanner.output_findings(&output) {
+    match secret_scanner.output_findings_ordered(&output) {
         Ok(_) => Ok(()),
         Err(err) => Err(SimpleError::with(
             "failed to output findings",
@@ -214,15 +215,13 @@ fn scan_dir(
     ss: &SecretScanner,
     recursive: bool,
     unzip: bool,
-) -> HashSet<FileFinding> {
-    let mut output: HashSet<FileFinding> = HashSet::new();
+) -> Vec<FileFinding> {
+    let mut output: Vec<FileFinding> = Vec::new();
 
     let scanning_closure = |file_path: &Path| {
         let f = File::open(file_path).unwrap();
         let mut inner_findings = scan_file(file_path, &ss, f, "", unzip);
-        for d in inner_findings.drain() {
-            output.insert(d);
-        }
+        output.append(&mut inner_findings);
     };
 
     if recursive {
@@ -277,8 +276,8 @@ fn scan_file<R: Read + io::Seek>(
     mut reader: R,
     path_prefix: &str,
     unzip: bool,
-) -> HashSet<FileFinding> {
-    let mut findings: HashSet<FileFinding> = HashSet::new();
+) -> Vec<FileFinding> {
+    let mut findings: Vec<FileFinding> = Vec::new();
     let path_string = String::from(Path::new(path_prefix).join(file_path).to_str().unwrap());
     info!("scan_file({:?})", path_string);
     let ext: String = match file_path.extension() {
@@ -307,10 +306,10 @@ fn scan_file<R: Read + io::Seek>(
                 &path_string,
                 unzip,
             );
-            for d in inner_findings.drain() {
+            for d in &inner_findings {
                 info!("FileFinding: {:?}", d);
-                findings.insert(d);
             }
+            findings.append(&mut inner_findings);
         }
         findings
     } else if TAREXTENSIONS.contains(&&*ext) && unzip {
@@ -332,10 +331,10 @@ fn scan_file<R: Read + io::Seek>(
                 &path_string,
                 unzip,
             );
-            for d in inner_findings.drain() {
+            for d in &inner_findings {
                 info!("FileFinding: {:?}", d);
-                findings.insert(d);
             }
+            findings.append(&mut inner_findings);
         }
         findings
     } else if GZEXTENSIONS.contains(&&*ext) && unzip {
@@ -354,10 +353,10 @@ fn scan_file<R: Read + io::Seek>(
         let inner_path: &Path = Path::new(&tempstring);
         info!("gunzip inner path: {:?}", inner_path);
         let mut inner_findings = scan_file(inner_path, ss, new_reader, &path_string, unzip);
-        for d in inner_findings.drain() {
+        for d in &inner_findings {
             info!("FileFinding: {:?}", d);
-            findings.insert(d);
         }
+        findings.append(&mut inner_findings);
         findings
     } else {
         let mut data = Vec::new();
@@ -369,33 +368,124 @@ fn scan_file<R: Read + io::Seek>(
     }
 }
 
-fn scan_bytes(input: Vec<u8>, ss: &SecretScanner, path: String) -> HashSet<FileFinding> {
+/// A single detection rule hit before overlapping hits are merged together.
+#[derive(Clone, Debug)]
+struct RawFinding {
+    reason: String,
+    start: usize,
+    end: usize,
+    string_found: String,
+}
+
+/// Two half-open byte ranges overlap when each starts before the other ends.
+/// Touching ranges (one ends where the next starts) are not considered overlapping.
+fn ranges_overlap(start_a: usize, end_a: usize, start_b: usize, end_b: usize) -> bool {
+    start_a < end_b && start_b < end_a
+}
+
+/// Sort (and collapse exact duplicates) so the serialized JSON is byte-identical across runs.
+fn sort_findings(findings: &mut Vec<FileFinding>) {
+    findings.sort_by(|a, b| {
+        (
+            &a.path,
+            a.linenum,
+            &a.lineindextuples,
+            &a.reasons,
+            &a.strings_found,
+        )
+            .cmp(&(
+                &b.path,
+                b.linenum,
+                &b.lineindextuples,
+                &b.reasons,
+                &b.strings_found,
+            ))
+    });
+    findings.dedup();
+}
+
+fn scan_bytes(input: Vec<u8>, ss: &SecretScanner, path: String) -> Vec<FileFinding> {
     info!("scan_bytes: {:?}", path);
-    let mut findings: HashSet<FileFinding> = HashSet::new();
+    let mut findings: Vec<FileFinding> = Vec::new();
     // Main loop - split the data based on newlines, then run get_matches() on each line,
     // then make a list of findings in output
     let lines = input.split(|&x| (x as char) == '\n');
     for (index, new_line) in lines.enumerate() {
         let results = ss.matches_entropy(new_line);
+        // Flatten into one entry per (rule, match) so overlaps across detection
+        // types (e.g. a regex rule and the generic entropy detector) can be merged
+        // into a single finding instead of being reported twice.
+        let mut raw_hits: Vec<RawFinding> = Vec::new();
         for (r, matches) in results {
-            let mut strings_found: Vec<String> = Vec::new();
-            let mut lineindextuples: Vec<(usize, usize)> = Vec::new();
             for m in matches {
                 let result = ASCII
                     .decode(&new_line[m.start()..m.end()], DecoderTrap::Ignore)
                     .unwrap_or_else(|_| "<STRING DECODE ERROR>".parse().unwrap());
-                strings_found.push(result);
-                lineindextuples.push((m.start(),m.end()));
-            }
-            if !strings_found.is_empty() {
-                findings.insert(FileFinding {
-                    strings_found,
+                raw_hits.push(RawFinding {
                     reason: r.clone(),
-                    path: path.clone(),
-                    linenum: index + 1,
-                    lineindextuples
+                    start: m.start(),
+                    end: m.end(),
+                    string_found: result,
                 });
             }
+        }
+        if raw_hits.is_empty() {
+            continue;
+        }
+        // Deterministic ordering before merging: position first, then rule name.
+        raw_hits.sort_by(|a, b| {
+            (a.start, a.end, &a.reason, &a.string_found).cmp(&(
+                b.start,
+                b.end,
+                &b.reason,
+                &b.string_found,
+            ))
+        });
+
+        // Greedily group overlapping hits. Hits are sorted by start position, so a
+        // new hit can only overlap the most recently opened group.
+        let mut merged_groups: Vec<Vec<RawFinding>> = Vec::new();
+        for hit in raw_hits {
+            let overlaps_last = match merged_groups.last() {
+                Some(group) => group.iter().any(|existing| {
+                    ranges_overlap(existing.start, existing.end, hit.start, hit.end)
+                }),
+                None => false,
+            };
+            if overlaps_last {
+                merged_groups.last_mut().unwrap().push(hit);
+            } else {
+                merged_groups.push(vec![hit]);
+            }
+        }
+
+        for group in merged_groups {
+            let mut strings_found: Vec<String> = Vec::new();
+            let mut lineindextuples: Vec<(usize, usize)> = Vec::new();
+            for hit in &group {
+                let tuple = (hit.start, hit.end);
+                if !lineindextuples.contains(&tuple) {
+                    lineindextuples.push(tuple);
+                    strings_found.push(hit.string_found.clone());
+                }
+            }
+            let mut reasons: Vec<String> = group.iter().map(|hit| hit.reason.clone()).collect();
+            reasons.sort();
+            reasons.dedup();
+            // A named regex rule is higher confidence than the generic entropy detector.
+            let reason = reasons
+                .iter()
+                .find(|name| name.as_str() != "Entropy")
+                .cloned()
+                .unwrap_or_else(|| reasons[0].clone());
+            findings.push(FileFinding {
+                strings_found,
+                reason,
+                reasons,
+                path: path.clone(),
+                linenum: index + 1,
+                lineindextuples,
+            });
         }
     }
     findings
@@ -486,5 +576,105 @@ mod tests {
         temp_dir.close().expect("couldn't close tempdir");
         let prg_out = str::from_utf8(&output.stdout).unwrap();
         assert_eq!("[]\n", prg_out);
+    }
+
+    // A high-entropy base64 word (decoded normalized entropy above the 0.6 default
+    // threshold) that the Generic Secret regex also matches. It contains no token
+    // from the built-in allowlist.
+    const OVERLAP_TOKEN: &str = "2xRiKZv1j9l7W4gzGPW4I41bSOlnUlDOL9vtxuBL89UJPVhI8KluBoqR";
+
+    #[test]
+    fn overlapping_regex_and_entropy_hits_are_merged() {
+        let mut ss_builder = SecretScannerBuilder::new();
+        ss_builder.add_entropy_findings = true;
+        let ss = ss_builder.build();
+        let input = format!("secret: {}\n", OVERLAP_TOKEN).into_bytes();
+
+        let findings = scan_bytes(input, &ss, String::from("leak.txt"));
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "overlapping hits must merge into one finding"
+        );
+        let finding = &findings[0];
+        assert_eq!(finding.reason, "Generic Secret");
+        assert_eq!(finding.reasons, vec!["Entropy", "Generic Secret"]);
+        assert_eq!(finding.linenum, 1);
+        assert_eq!(finding.lineindextuples.len(), 2);
+        assert_eq!(finding.strings_found.len(), 2);
+        // The entropy-only span is nested inside the regex match span.
+        assert!(finding
+            .lineindextuples
+            .iter()
+            .any(|(start, end)| *start == 8 && *end == 64));
+    }
+
+    #[test]
+    fn non_overlapping_hits_remain_separate_findings() {
+        let ss = SecretScannerBuilder::new().build();
+        let input = String::from("My email is username@mail.com\n").into_bytes();
+
+        let findings = scan_bytes(input, &ss, String::from("mail.txt"));
+
+        assert_eq!(findings.len(), 1);
+        let finding = &findings[0];
+        assert_eq!(finding.reason, "Email address");
+        assert_eq!(finding.reasons, vec!["Email address"]);
+        assert_eq!(finding.linenum, 1);
+    }
+
+    #[test]
+    fn repeated_runs_produce_byte_identical_output() {
+        let temp_dir = tempdir().expect("couldn't make tempdir");
+        write_temp_file(
+            &temp_dir,
+            "insecure-file.txt",
+            format!("secret: {}\n", OVERLAP_TOKEN).as_str(),
+        );
+
+        let cmd_args = ["--entropy", "."];
+        let first = run_command_in_dir(&temp_dir, "duroc_hog", &cmd_args).unwrap();
+        for _ in 0..4 {
+            let repeated = run_command_in_dir(&temp_dir, "duroc_hog", &cmd_args).unwrap();
+            assert_eq!(first.stdout, repeated.stdout);
+        }
+
+        let parsed: serde_json::Value = serde_json::from_slice(first.stdout.as_slice()).unwrap();
+        let findings = parsed.as_array().unwrap();
+        assert_eq!(findings.len(), 1);
+        let finding = &findings[0];
+        assert_eq!(finding["reason"], "Generic Secret");
+        assert_eq!(
+            finding["reasons"],
+            serde_json::json!(["Entropy", "Generic Secret"])
+        );
+        temp_dir.close().expect("couldn't close tempdir");
+    }
+
+    #[test]
+    fn directory_findings_are_sorted_by_path_and_line() {
+        let temp_dir = tempdir().expect("couldn't make tempdir");
+        std::fs::create_dir(temp_dir.path().join("sub")).unwrap();
+        write_temp_file(
+            &temp_dir,
+            "z-last.txt",
+            format!("secret: {}\n", OVERLAP_TOKEN).as_str(),
+        );
+        write_temp_file(
+            &temp_dir,
+            "sub/a-first.txt",
+            "My email is username@mail.com\n",
+        );
+
+        let output = run_command_in_dir(&temp_dir, "duroc_hog", &["--entropy", "."]).unwrap();
+        let parsed: Vec<FileFinding> = serde_json::from_slice(&output.stdout).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].path.ends_with("a-first.txt"));
+        assert!(parsed[1].path.ends_with("z-last.txt"));
+        assert_eq!(parsed[0].reasons, vec!["Email address"]);
+        assert_eq!(parsed[1].reasons, vec!["Entropy", "Generic Secret"]);
+        temp_dir.close().expect("couldn't close tempdir");
     }
 }
